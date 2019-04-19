@@ -18,7 +18,25 @@ from std_msgs.msg import UInt8
 from cv_bridge import CvBridge, CvBridgeError
 import smach
 import smach_ros
+from imutils.video import VideoStream
+from imutils.video import FPS
+import argparse
 
+
+
+import cormodule as cm
+import mobilenet_simples as mb
+
+bridge = CvBridge()
+
+cv_image = None
+
+(major, minor) = cv2.__version__.split(".")[:2]
+
+# Variáveis para permitir que o roda_todo_frame troque dados com a máquina de estados
+media = []
+centro = []
+area = 0.0
 
 # Variável do bumper
 bumper = 0
@@ -36,6 +54,10 @@ numero_scans_esquerda_tras = np.arange(181, 181 + angulo_desvio, 2)
 # Variável que conta quantos vezez em seguida o scan foi acionado
 vezez = 0
 
+
+# Variáveis lineares
+linear = 0.3
+
 # Variáveis angulares
 relative_angle = math.radians(45)
 angular_speed = math.pi/5
@@ -46,7 +68,7 @@ area_ideal = 60000 # área da distancia ideal do contorno - note que varia com a
 tolerancia_area = 20000
 
 # Atraso máximo permitido entre a imagem sair do Turbletbot3 e chegar no laptop do aluno
-atraso = 1.5
+atraso = 0.5
 check_delay = False # Só usar se os relógios ROS da Raspberry e do Linux desktop estiverem sincronizados
 
 # Variáveis de checagem
@@ -60,6 +82,7 @@ DIREITA = 2
 FRENTE = 1
 TRAS =2
 
+TRACKING = 1
 
 # Variáveis direcionais
 lado = ESQUERDA
@@ -70,7 +93,121 @@ sleep_time = 0.02
 time_start = 0
 
 # Variável da distancia dos lasers
-distancia = 0.4
+distancia = 0.3
+
+# Variável das cores
+area_azul = None
+media_azul = None
+area_vermelho = None
+media_vermelho = None
+
+# Variável da mobilenet
+results = []
+contador = 0
+
+# Variável da tracking
+tracking = NADA
+
+# Funções usadas pelos Subscribers
+
+def roda_todo_frame(imagem): #função usada pelo subscriber recebe_imagem
+	global cv_image
+	global centro
+	global media_vermelho
+	global area_vermelho
+	global media_azul
+	global area_azul
+	global results
+	global tracking
+	global contador
+	global centro_tracking
+	global fps
+	global initBB
+
+	now = rospy.get_rostime()
+	imgtime = imagem.header.stamp
+	lag = now-imgtime
+	delay = lag.secs
+	if delay > atraso and check_delay==True:
+		return 
+	try:
+		antes = time.clock()
+		cv_image = bridge.compressed_imgmsg_to_cv2(imagem, "bgr8")
+		centro,media_vermelho, area_vermelho, media_azul, area_azul = cm.identifica_cor(cv_image)
+
+		if tracking == NADA:
+			#if cv_image is not None:
+			results = mb.detect(cv_image)
+
+		else:
+			tracking_update()
+
+		if len(results) > 0:
+			contador += 1
+		else:
+			contador = 0
+
+		if contador > 3:
+			tracking = TRACKING
+
+			pi_x = results[0][2][0]
+			pi_y = results[0][2][1]
+			w = results[0][3][0]
+			h = results[0][3][1]
+
+			centro_x = pi_x + w/2
+			centro_y = pi_y + h/2
+			
+
+			centro_tracking = (centro_x, centro_y)
+
+			initBB = (pi_x, pi_y, w, h)
+			tracker.init(cv_image, initBB)
+			fps = FPS().start()
+			results = []
+			tracking_update()
+
+		depois = time.clock()
+		cv2.imshow("Camera", cv_image)
+	except CvBridgeError as e:
+		print('ex', e)
+
+
+def tracking_update():
+	global tracker
+	global tracking
+	global fps
+	global cv_image
+	global box_tracking
+	global centro_tracking
+
+	fps.update()
+	fps.stop()
+
+	success, box_tracking = tracker.update(cv_image)
+
+	# check to see if the tracking was a success
+	if success:
+		(x, y, w, h) = [int(v) for v in box_tracking]
+		cv2.rectangle(cv_image, (x, y), (x + w, y + h),
+			(0, 255, 0), 2)
+
+		centro_x = x + w/2
+		centro_y = y + h/2
+
+		centro_tracking = (centro_x, centro_y)
+		cm.cross(cv_image, centro_tracking, [255,0,0], 1, 17)
+		
+
+	else:
+		tracker.clear()
+		tracking = NADA
+		if int(major) == 3 and int(minor) < 3:
+			tracker = cv2.Tracker_create(args["tracker"].upper())
+
+		else:
+			tracker = OPENCV_OBJECT_TRACKERS[args["tracker"]]()
+
 
 
 
@@ -214,12 +351,18 @@ def checa_sensoreres():
 ## Classes - estados
 class Roda(smach.State):
 	def __init__(self):
-		smach.State.__init__(self, outcomes=['roda', 'obstaculo'])
+		smach.State.__init__(self, outcomes=['roda', 'obstaculo', 'tracking'])
 
 	def execute(self, userdata):
 		global velocidade_saida
 		global direcao
-
+		global results
+		global contador
+		global tracker
+		global tracking
+		global fps
+		global results
+		global cv_image
 
 		rospy.sleep(sleep_time )
 		checa_sensoreres()
@@ -230,12 +373,97 @@ class Roda(smach.State):
 		if sensores != 0:
 			return 'obstaculo'
 
+		elif area_azul > area_ideal or area_vermelho > area_ideal or tracking == TRACKING:
+			return 'tracking'
+
 		else:
-			vel = Twist(Vector3(0.3, 0, 0), Vector3(0, 0, 0))
+			vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
 			velocidade_saida.publish(vel)
 			return 'roda'
 
 
+class Tracking(smach.State):
+	def __init__(self):
+		smach.State.__init__(self, outcomes=['roda', 'obstaculo', 'tracking'])
+
+	def execute(self, userdata):
+		global velocidade_saida
+		global direcao
+		rospy.sleep(sleep_time )
+		checa_sensoreres()
+		
+
+
+		if sensores != 0:
+			return 'obstaculo'
+
+		elif tracking == TRACKING:
+			direcao =FRENTE
+
+			if  math.fabs(centro_tracking[0]) > math.fabs(centro[0] + tolerancia_x):
+				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, angular_speed))
+				velocidade_saida.publish(vel)
+				print('tracking esquerda')
+				return 'roda'
+
+			if math.fabs(centro_tracking[0]) < math.fabs(centro[0] - tolerancia_x):
+				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, -angular_speed))
+				velocidade_saida.publish(vel)
+				print('tracking direita')
+				return 'roda'
+
+			else:
+				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
+				velocidade_saida.publish(vel)
+				print('tracking frente')
+				return 'roda'
+
+		elif area_azul > area_vermelho:
+			direcao = TRAS
+
+			if  math.fabs(media_azul[0]) > math.fabs(centro[0] + tolerancia_x):
+				vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, -(angular_speed)))
+				velocidade_saida.publish(vel)
+				print('azul esquerda')
+				return 'roda'
+
+			if math.fabs(media_azul[0]) < math.fabs(centro[0] - tolerancia_x):
+				vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, (angular_speed)))
+				velocidade_saida.publish(vel)
+				print('azul direita')
+				return 'roda'
+
+			else:
+				vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, 0))
+				velocidade_saida.publish(vel)
+				print('tracking frente')
+				return 'roda'
+
+		elif area_azul < area_vermelho:
+			direcao =FRENTE
+
+			if  math.fabs(media_vermelho[0]) > math.fabs(centro[0] + tolerancia_x):
+				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, (angular_speed)))
+				velocidade_saida.publish(vel)
+				print('vermelho esquerda')
+				return 'roda'
+
+			if math.fabs(media_vermelho[0]) < math.fabs(centro[0] - tolerancia_x):
+				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, -(angular_speed)))
+				velocidade_saida.publish(vel)
+				print('vermelho direita')
+				return 'roda'
+			else:
+				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
+				velocidade_saida.publish(vel)
+				print('tracking frente')
+				return 'roda'
+
+
+		else:
+			vel = Twist(Vector3(0, 0, 0), Vector3(0, 0, 0))
+			velocidade_saida.publish(vel)
+			return 'roda'
 
 		
 
@@ -254,7 +482,7 @@ class Pra_Tras(smach.State):
 		dif = time_now - time_start
 
 		if dif < 1:
-			vel = Twist(Vector3(-0.3, 0, 0), Vector3(0, 0, 0))
+			vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, 0))
 			velocidade_saida.publish(vel)
 			return 'tras'
 
@@ -279,7 +507,7 @@ class Pra_Frente(smach.State):
 		dif = time_now - time_start
 
 		if dif < 1:
-			vel = Twist(Vector3(0.3, 0, 0), Vector3(0, 0, 0))
+			vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
 			velocidade_saida.publish(vel)
 			return 'frente'
 
@@ -379,7 +607,45 @@ class Obstaculo(smach.State):
 def main():
 	global velocidade_saida
 	global buffer
+	global tracker
+	global OPENCV_OBJECT_TRACKERS
+	global args
 
+
+	# construct the argument parser and parse the arguments
+	ap = argparse.ArgumentParser()
+	ap.add_argument("-v", "--video", type=str,
+		help="path to input video file")
+	ap.add_argument("-t", "--tracker", type=str, default="kcf",
+		help="OpenCV object tracker type")
+	args = vars(ap.parse_args())
+
+	# extract the OpenCV version info
+	(major, minor) = cv2.__version__.split(".")[:2]
+
+	# if we are using OpenCV 3.2 OR BEFORE, we can use a special factory
+	# function to create our object tracker
+	if int(major) == 3 and int(minor) < 3:
+		tracker = cv2.Tracker_create(args["tracker"].upper())
+
+	# otherwise, for OpenCV 3.3 OR NEWER, we need to explicity call the
+	# approrpiate object tracker constructor:
+	else:
+		# initialize a dictionary that maps strings to their corresponding
+		# OpenCV object tracker implementations
+		OPENCV_OBJECT_TRACKERS = {
+			"csrt": cv2.TrackerCSRT_create,
+			"kcf": cv2.TrackerKCF_create,
+			"boosting": cv2.TrackerBoosting_create,
+			"mil": cv2.TrackerMIL_create,
+			"tld": cv2.TrackerTLD_create,
+			"medianflow": cv2.TrackerMedianFlow_create,
+			"mosse": cv2.TrackerMOSSE_create
+		}
+
+		# grab the appropriate object tracker using our dictionary of
+		# OpenCV object tracker objects
+		tracker = OPENCV_OBJECT_TRACKERS[args["tracker"]]()
 	
 	rospy.init_node('estados')
 	sm = smach.StateMachine(outcomes=['terminei'])
@@ -388,7 +654,7 @@ def main():
 	sis.start()
 
 	# Para usar a webcam 
-	#recebe_imagemr = rospy.Subscriber("/kamera", CompressedImage, roda_todo_frame, queue_size=1, buff_size = 2**24) #subscriber da camera do PC
+	recebe_imagemr = rospy.Subscriber("/kamera", CompressedImage, roda_todo_frame, queue_size=1, buff_size = 2**24) #subscriber da camera do PC
 	#recebe_imagem = rospy.Subscriber("/kamera", CompressedImage, roda_todo_frame, queue_size=10, buff_size = 2**24) #subscriber da camera do robo 
 	recebe_scan = rospy.Subscriber("/scan", LaserScan, scaneou) #subscriber do scan laser
 	recebe_bumper = rospy.Subscriber("/bumper", UInt8, bumper_info) #subscriber do bumber
@@ -409,7 +675,7 @@ def main():
 
 		smach.StateMachine.add('RODA', Roda(),
 								transitions={'obstaculo': 'OBSTACULO',
-								'roda':'RODA'})
+								'roda':'RODA', 'tracking' : 'TRACKING'})
 
 		smach.StateMachine.add('GIRANDO', Gira(),
 								transitions={'girando': 'GIRANDO',
@@ -426,6 +692,9 @@ def main():
 								transitions={'frente': 'FRENTE',
 								'obstaculo':'OBSTACULO', 'acabou' : 'GIRANDO'})
 
+		smach.StateMachine.add('TRACKING', Tracking(),
+								transitions={'obstaculo': 'OBSTACULO',
+								'roda':'RODA', 'tracking' : 'TRACKING'})
 
 
 		
