@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 # -*- coding:utf-8 -*-
 
-__author__ = ["Rachel P. B. Moraes", "Igor Montagner", "Fabio Miranda"]
+__author__ = ["Beatriz Mie", "Gabriel Zanetti"]
 
 
 import rospy
@@ -33,6 +33,16 @@ cv_image = None
 
 (major, minor) = cv2.__version__.split(".")[:2]
 
+
+# Classes da Mobilenet
+CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
+	"bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+	"dog", "horse", "motorbike", "person", "pottedplant", "sheep",
+	"sofa", "train", "tvmonitor"]
+
+alvo = "cat"
+
+
 # Variáveis para permitir que o roda_todo_frame troque dados com a máquina de estados
 media = []
 centro = []
@@ -55,21 +65,24 @@ numero_scans_esquerda_tras = np.arange(181, 181 + angulo_desvio, 2)
 vezez = 0
 
 
-# Variáveis lineares
-linear = 0.3
+# Variáveis lineares lin_max = 0.22
+linear_speed = 0.3
+linear_speed_tracking = 0
 
-# Variáveis angulares
+# Variáveis angulares ang_max = 2.84
 relative_angle = math.radians(45)
 angular_speed = math.pi/5
+angular_speed_gira = math.pi/5
 
 tolerancia_x = 50
 tolerancia_y = 20
-area_ideal = 60000 # área da distancia ideal do contorno - note que varia com a resolução da câmera
+area_ideal = 20000 # área da distancia ideal do contorno - note que varia com a resolução da câmera
+area_minima = 10000
 tolerancia_area = 20000
 
 # Atraso máximo permitido entre a imagem sair do Turbletbot3 e chegar no laptop do aluno
 atraso = 0.5
-check_delay = False # Só usar se os relógios ROS da Raspberry e do Linux desktop estiverem sincronizados
+check_delay = True # Só usar se os relógios ROS da Raspberry e do Linux desktop estiverem sincronizados
 
 # Variáveis de checagem
 NADA = 0
@@ -84,6 +97,9 @@ TRAS =2
 
 TRACKING = 1
 
+AZUL = 0
+VERMELHO = 1
+
 # Variáveis direcionais
 lado = ESQUERDA
 direcao = FRENTE
@@ -93,7 +109,7 @@ sleep_time = 0.02
 time_start = 0
 
 # Variável da distancia dos lasers
-distancia = 0.3
+distancia = 0.2
 
 # Variável das cores
 area_azul = None
@@ -123,11 +139,15 @@ def roda_todo_frame(imagem): #função usada pelo subscriber recebe_imagem
 	global centro_tracking
 	global fps
 	global initBB
+	global area_tracking
+	global WIDTH
+	global HEIGTH
 
 	now = rospy.get_rostime()
 	imgtime = imagem.header.stamp
 	lag = now-imgtime
 	delay = lag.secs
+
 	if delay > atraso and check_delay==True:
 		return 
 	try:
@@ -135,9 +155,11 @@ def roda_todo_frame(imagem): #função usada pelo subscriber recebe_imagem
 		cv_image = bridge.compressed_imgmsg_to_cv2(imagem, "bgr8")
 		centro,media_vermelho, area_vermelho, media_azul, area_azul = cm.identifica_cor(cv_image)
 
+		WIDTH, HEIGTH, g = cv_image.shape
+
 		if tracking == NADA:
-			#if cv_image is not None:
-			results = mb.detect(cv_image)
+
+			results = mb.detect(cv_image, alvo)
 
 		else:
 			tracking_update()
@@ -152,12 +174,16 @@ def roda_todo_frame(imagem): #função usada pelo subscriber recebe_imagem
 
 			pi_x = results[0][2][0]
 			pi_y = results[0][2][1]
-			w = results[0][3][0]
-			h = results[0][3][1]
+			pf_x = results[0][3][0]
+			pf_y = results[0][3][1]
+
+			w = pf_x - pi_x
+			h = pf_y - pi_y
 
 			centro_x = pi_x + w/2
 			centro_y = pi_y + h/2
-			
+
+			area_tracking = w*h
 
 			centro_tracking = (centro_x, centro_y)
 
@@ -180,6 +206,7 @@ def tracking_update():
 	global cv_image
 	global box_tracking
 	global centro_tracking
+	global area_tracking
 
 	fps.update()
 	fps.stop()
@@ -197,6 +224,7 @@ def tracking_update():
 
 		centro_tracking = (centro_x, centro_y)
 		cm.cross(cv_image, centro_tracking, [255,0,0], 1, 17)
+		area_tracking = w*h
 		
 
 	else:
@@ -341,11 +369,43 @@ def checa_sensoreres():
 		sensores = BUMPER
 
 
-
+def velocidade_linear(area_im, cor):
+	global linear_speed_tracking
 	
+	if cor == VERMELHO:
+		area_max = WIDTH*HEIGTH*0.75
+		m = -0.22/(area_max - area_ideal)
+		b = -m*area_max
+		vel = (m*area_im + b)
+		linear_speed_tracking = (vel)
+
+	else:
+		area_max = WIDTH*HEIGTH*0.75
+		m = -0.22/(area_max - area_ideal)
+		b = -m*area_max
+		vel = (m*area_im + b)
+		linear_speed_tracking = (vel)
 
 
 
+
+def velocidade_angular(diferenca):
+	global angular_speed
+
+
+	m = 1.6/(WIDTH/2)
+	b = -m*0
+	ang = m*diferenca + b
+	angular_speed = ang
+	print(ang)
+
+
+
+def mobilenet_alvo():
+	global alvo
+	print("Você deve selecionar um tipo de objeto da seguinte lista: ")
+	print(CLASSES)
+	alvo = raw_input("Insira sua escolha: ")
 
 
 ## Classes - estados
@@ -377,7 +437,7 @@ class Roda(smach.State):
 			return 'tracking'
 
 		else:
-			vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
+			vel = Twist(Vector3(0, 0, 0), Vector3(0, 0, 0))
 			velocidade_saida.publish(vel)
 			return 'roda'
 
@@ -389,6 +449,7 @@ class Tracking(smach.State):
 	def execute(self, userdata):
 		global velocidade_saida
 		global direcao
+		global angular_speed
 		rospy.sleep(sleep_time )
 		checa_sensoreres()
 		
@@ -399,62 +460,75 @@ class Tracking(smach.State):
 
 		elif tracking == TRACKING:
 			direcao =FRENTE
+			dif = math.fabs(centro[0] - centro_tracking[0])
+			velocidade_angular(dif)
+
+			
 
 			if  math.fabs(centro_tracking[0]) > math.fabs(centro[0] + tolerancia_x):
-				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, angular_speed))
+				vel = Twist(Vector3(linear_speed, 0, 0), Vector3(0, 0, angular_speed))
 				velocidade_saida.publish(vel)
 				print('tracking esquerda')
 				return 'roda'
 
 			if math.fabs(centro_tracking[0]) < math.fabs(centro[0] - tolerancia_x):
-				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, -angular_speed))
+				vel = Twist(Vector3(linear_speed, 0, 0), Vector3(0, 0, -angular_speed))
 				velocidade_saida.publish(vel)
 				print('tracking direita')
 				return 'roda'
 
 			else:
-				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
+				vel = Twist(Vector3(linear_speed, 0, 0), Vector3(0, 0, 0))
 				velocidade_saida.publish(vel)
 				print('tracking frente')
 				return 'roda'
 
 		elif area_azul > area_vermelho:
 			direcao = TRAS
+			dif = math.fabs(centro[0] - media_azul[0])
+			velocidade_linear(area_azul, AZUL)
+			velocidade_angular(dif)
+			
 
 			if  math.fabs(media_azul[0]) > math.fabs(centro[0] + tolerancia_x):
-				vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, -(angular_speed)))
+				vel = Twist(Vector3(-linear_speed, 0, 0), Vector3(0, 0, -(angular_speed)))
 				velocidade_saida.publish(vel)
 				print('azul esquerda')
 				return 'roda'
 
 			if math.fabs(media_azul[0]) < math.fabs(centro[0] - tolerancia_x):
-				vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, (angular_speed)))
+				vel = Twist(Vector3(-linear_speed, 0, 0), Vector3(0, 0, (angular_speed)))
 				velocidade_saida.publish(vel)
 				print('azul direita')
 				return 'roda'
 
 			else:
-				vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, 0))
+				vel = Twist(Vector3(-linear_speed, 0, 0), Vector3(0, 0, 0))
 				velocidade_saida.publish(vel)
 				print('tracking frente')
 				return 'roda'
 
 		elif area_azul < area_vermelho:
 			direcao =FRENTE
+			dif = math.fabs(centro[0] - media_vermelho[0])
+			velocidade_linear(area_vermelho, VERMELHO)
+			velocidade_angular(dif)
+			if linear_speed_tracking <= 0.1:
+				angular_speed = 0
 
 			if  math.fabs(media_vermelho[0]) > math.fabs(centro[0] + tolerancia_x):
-				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, (angular_speed)))
+				vel = Twist(Vector3(linear_speed_tracking, 0, 0), Vector3(0, 0, (angular_speed)))
 				velocidade_saida.publish(vel)
 				print('vermelho esquerda')
 				return 'roda'
 
 			if math.fabs(media_vermelho[0]) < math.fabs(centro[0] - tolerancia_x):
-				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, -(angular_speed)))
+				vel = Twist(Vector3(linear_speed_tracking, 0, 0), Vector3(0, 0, -(angular_speed)))
 				velocidade_saida.publish(vel)
 				print('vermelho direita')
 				return 'roda'
 			else:
-				vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
+				vel = Twist(Vector3(linear_speed_tracking, 0, 0), Vector3(0, 0, 0))
 				velocidade_saida.publish(vel)
 				print('tracking frente')
 				return 'roda'
@@ -482,7 +556,7 @@ class Pra_Tras(smach.State):
 		dif = time_now - time_start
 
 		if dif < 1:
-			vel = Twist(Vector3(-linear, 0, 0), Vector3(0, 0, 0))
+			vel = Twist(Vector3(-linear_speed, 0, 0), Vector3(0, 0, 0))
 			velocidade_saida.publish(vel)
 			return 'tras'
 
@@ -507,7 +581,7 @@ class Pra_Frente(smach.State):
 		dif = time_now - time_start
 
 		if dif < 1:
-			vel = Twist(Vector3(linear, 0, 0), Vector3(0, 0, 0))
+			vel = Twist(Vector3(linear_speed, 0, 0), Vector3(0, 0, 0))
 			velocidade_saida.publish(vel)
 			return 'frente'
 
@@ -534,18 +608,18 @@ class Gira(smach.State):
 		rospy.sleep(sleep_time )
 
 		time_now = rospy.Time.now().to_sec()
-		current_angle = angular_speed*(time_now - time_start)
+		current_angle = angular_speed_gira*(time_now - time_start)
 
 		if sensores == BUMPER:
 			return 'obstaculo'
 
 		elif (current_angle < relative_angle) and lado == ESQUERDA:
-			vel = Twist(Vector3(0, 0, 0), Vector3(0, 0, angular_speed))
+			vel = Twist(Vector3(0, 0, 0), Vector3(0, 0, angular_speed_gira))
 			velocidade_saida.publish(vel)
 			return 'girando'
 
 		elif (-current_angle > -relative_angle) and lado == DIREITA:
-			vel = Twist(Vector3(0, 0, 0), Vector3(0, 0, -angular_speed))
+			vel = Twist(Vector3(0, 0, 0), Vector3(0, 0, -angular_speed_gira))
 			velocidade_saida.publish(vel)
 			return 'girando'
 
@@ -611,6 +685,8 @@ def main():
 	global OPENCV_OBJECT_TRACKERS
 	global args
 
+	# Seleciona o alvo
+	mobilenet_alvo()
 
 	# construct the argument parser and parse the arguments
 	ap = argparse.ArgumentParser()
@@ -653,9 +729,7 @@ def main():
 	sis = smach_ros.IntrospectionServer('server_name', sm, '/SM_ROOT')
 	sis.start()
 
-	# Para usar a webcam 
 	recebe_imagemr = rospy.Subscriber("/kamera", CompressedImage, roda_todo_frame, queue_size=1, buff_size = 2**24) #subscriber da camera do PC
-	#recebe_imagem = rospy.Subscriber("/kamera", CompressedImage, roda_todo_frame, queue_size=10, buff_size = 2**24) #subscriber da camera do robo 
 	recebe_scan = rospy.Subscriber("/scan", LaserScan, scaneou) #subscriber do scan laser
 	recebe_bumper = rospy.Subscriber("/bumper", UInt8, bumper_info) #subscriber do bumber
 
@@ -667,11 +741,6 @@ def main():
 	# Open the container
 	with sm:
 		# Add states to the container
-		#smach.StateMachine.add('LONGE', Longe(), 
-		#                       transitions={'ainda_longe':'ANDANDO', 
-		#                                    'perto':'terminei'})
-		#smach.StateMachine.add('ANDANDO', Andando(), 
-		#                       transitions={'ainda_longe':'LONGE'})
 
 		smach.StateMachine.add('RODA', Roda(),
 								transitions={'obstaculo': 'OBSTACULO',
